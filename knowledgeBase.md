@@ -66,3 +66,19 @@ Build order:
   user created and cloned it — all project files (`docker-compose.yml`,
   `db/`, `.gitignore`, `.env.example`, this file) relocated there. All
   paths below assume this location going forward.
+- Postgres runs in Docker (`postgres:16`, port `5433` to avoid clashing with
+  any local install), seeded via `db/init/*.sql` — these only execute on
+  **first** container init (empty volume), so any schema/seed change needs
+  `docker compose down -v && docker compose up -d` to actually take effect.
+- Scaled the seed data from ~200 rows to **3,824** (60 customers, 1,236
+  orders, 2,378 order_items, 150 systems) by adding `03_scale_up.sql` —
+  52 procedurally-generated customers plus bounded random background
+  orders across 2023-2026, layered on top of the original 8 hand-crafted
+  "signature" customers without touching their numbers. Bulk-customer
+  bounds (≤9 orders/year, ≤$4,500/order, cost fraction ≤0.80) were chosen
+  specifically to stay under the signature customers' 2025 thresholds.
+- **Verified empirically** (not just designed) that "best customer 2025"
+  genuinely has three different correct answers depending on definition:
+  revenue → Acme Corp ($50,000.01), order count → Globex Inc (12), profit
+  → Stark Industries ($27,999.96). This is the actual data-level ambiguity
+  the Clarification Engine needs to detect later.
