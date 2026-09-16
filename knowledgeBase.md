@@ -82,3 +82,83 @@ Build order:
   revenue → Acme Corp ($50,000.01), order count → Globex Inc (12), profit
   → Stark Industries ($27,999.96). This is the actual data-level ambiguity
   the Clarification Engine needs to detect later.
+- Project venv created; `GROQ_API_KEY`/`GOOGLE_API_KEY` still empty in
+  `.env` (never got filled in back in `LangChain_Labs` either — the HF
+  detour took over there). Installed packages for all three providers
+  (Groq/Gemini/HF) so nothing blocks on this yet, but a real chat-model
+  key is needed before Step 4 (ambiguity classifier) can run — flagged
+  since this project leans on **structured output**, which Groq/Gemini
+  handle more reliably than HF's routed inference for function-calling.
+
+### Step 3 — Schema introspection + retrieval
+
+- `schema_introspection.py` uses SQLAlchemy's `inspect()` (not raw
+  `information_schema` queries) to pull tables/columns/types/PKs/FKs —
+  verified output matches `01_schema.sql` exactly, including correctly
+  identifying `systems.signed_off_at` as nullable.
+- `schema_retrieval.py` embeds each table's description with the same
+  local `sentence-transformers/all-MiniLM-L6-v2` model from the
+  `LangChain_Labs` PDF lab, and ranks tables by cosine similarity per
+  question — genuinely RAG over the schema, not a document.
+- With only 4 tables this is overkill in practice (could just inject all
+  4 descriptions every time for near-zero token cost) — built anyway
+  since the mechanism is what matters, and it'd work unchanged at real
+  scale (100s of tables).
+- **Useful validation, not just a pass**: for "who was the best customer
+  last year?", `customers` and `orders` came back nearly tied
+  (0.28 vs 0.28) — correctly reflecting that this question genuinely
+  needs *both* tables joined. This is why `top_k=2` (not 1) matters: at
+  `top_k=1` the SQL generator would silently lose a table it needs.
+
+### Provider decision: Gemini (not Groq)
+
+- Went with `GOOGLE_API_KEY` / `ChatGoogleGenerativeAI` instead of Groq.
+- `gemini-2.5-flash` is **deprecated for new accounts** — 404s with a
+  message pointing at the replacement. Correct current model ID:
+  `gemini-3.6-flash` (confirmed working via `gemini_smoke_test.py`).
+- **Gotcha to remember for the result-formatting step later**:
+  `result.content` on this model comes back as a **list of content
+  blocks** (`[{'type': 'text', 'text': '...', 'extras': {...}}]`), not a
+  plain string. Doesn't affect the structured-output steps (those return
+  a parsed Pydantic object, not raw `.content`), but anything reading
+  `.content` directly needs to extract the `text`-type block, not assume
+  a string.
+
+### Step 4 — Ambiguity classifier
+
+- `AmbiguityCheck` (Pydantic) + `model.with_structured_output(...)` on
+  Gemini. Correctly classified the systems question as unambiguous and
+  the "best customer" question as ambiguous on the first real test.
+- **Caught a genuine RAG failure mode, not a hypothetical one**: first
+  run used `schema_retrieval.py`'s `top_k=2`, which for "best customer"
+  only returned `customers` + `orders` — never `order_items`. Since
+  `order_items` is the only table with `cost_price`, the classifier
+  literally could not propose a "highest profit" interpretation; it
+  wasn't shown the data that would make profit computable. It offered
+  "average order value" instead as a 3rd option, which isn't one of the
+  three definitions actually engineered into the seed data.
+- **Fix**: since the schema is only 4 tables, skip retrieval-filtering
+  for this step entirely and hand the classifier all 4 table
+  descriptions unconditionally — trivial token cost at this scale, and
+  removes the recall gap. Re-tested: "highest total profit" now appears,
+  with a definition (`sum of (unit_price - cost_price) * quantity`)
+  matching exactly the formula used to verify Stark Industries' profit
+  lead back in Step 1.
+- **Lesson**: retrieval recall directly bounds what a downstream LLM can
+  even consider — a missed table isn't just a missing JOIN option, it's
+  missing *knowledge* the model has no way to know it's missing. At real
+  scale (100s of tables) this exact gap would be much harder to notice
+  than it was here with only 4 tables to reason about.
+- **Refactored** the fix: instead of bypassing `retrieve_relevant_tables`
+  entirely (two different schema-context mechanisms in the codebase),
+  call it with `top_k=4` — with only 4 tables that returns everything
+  anyway (identical outcome, re-verified), but keeps one consistent
+  retrieval code path that Step 5 will also use, and one that starts
+  filtering for real automatically once the schema grows past 4 tables,
+  with no code change needed later.
+- Also hit, unrelated to the code: Docker Desktop wasn't running after a
+  machine restart, so Postgres connections timed out. `restart:
+  unless-stopped` in `docker-compose.yml` only takes effect once the
+  Docker daemon itself is running — it auto-recovered the container the
+  moment Docker Desktop was started again, no `docker compose up`
+  needed.
