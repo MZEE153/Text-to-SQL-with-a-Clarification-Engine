@@ -1,22 +1,22 @@
-services:
-  postgres:
-    image: postgres:16
-    container_name: txt2sql_postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "5433:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+services:  # top-level key: the list of containers this file defines
+  postgres:  # our one service; "postgres" is also its hostname on the compose network
+    image: postgres:16  # official PostgreSQL 16 image from Docker Hub
+    container_name: txt2sql_postgres  # fixed container name so commands like `docker exec txt2sql_postgres ...` always work
+    restart: unless-stopped  # auto-restart after crashes/reboots (needs the Docker Desktop daemon itself to be running)
+    environment:  # environment variables handed to the container; the image uses them to create the first user and database
+      POSTGRES_USER: ${POSTGRES_USER}  # superuser name, substituted from .env at startup
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}  # superuser password, substituted from .env (never hard-coded here)
+      POSTGRES_DB: ${POSTGRES_DB}  # name of the database created on first start
+    ports:  # publish container ports to the host machine
+      - "5433:5432"  # host port 5433 -> container port 5432 (Postgres default); 5433 avoids clashing with any local Postgres on 5432
+    volumes:  # storage attached to the container
+      - pgdata:/var/lib/postgresql/data  # named volume holding the database files, so data survives container restarts
+      - ./db/init:/docker-entrypoint-initdb.d  # every .sql file here runs in filename order, but ONLY on first init of an empty volume
+    healthcheck:  # how Docker decides whether the container is actually ready
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]  # pg_isready succeeds once Postgres accepts connections
+      interval: 5s  # run the check every 5 seconds
+      timeout: 5s  # a single check may take at most 5 seconds
+      retries: 10  # after 10 consecutive failures the container is marked unhealthy
 
-volumes:
-  pgdata:
+volumes:  # top-level key: named volumes Docker manages
+  pgdata:  # declares the volume used above (`docker compose down -v` deletes it, which forces a fresh re-seed)
