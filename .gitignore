@@ -4,6 +4,8 @@ venv/
 __pycache__/
 # Individual compiled bytecode files
 *.pyc
+# Saved conversation state for paused pipeline runs (contains user questions and query results)
+checkpoints.sqlite*
 # The REAL secrets file (API keys, DB password) -- must never be committed.
 # NOTE: .gitignore only supports comments on their own line; a trailing "# ..." would become part of the pattern and break the rule.
 .env

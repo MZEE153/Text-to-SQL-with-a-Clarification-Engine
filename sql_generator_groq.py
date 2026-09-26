@@ -7,10 +7,12 @@ Groq supports native tool-calling, so with_structured_output works the
 same way it does for Gemini -- no PydanticOutputParser fallback needed
 here, unlike the HF attempt.
 """
+from datetime import date  # standard library: today's date (the model cannot know it)
 from dotenv import load_dotenv  # reads KEY=VALUE lines from .env so GROQ_API_KEY becomes available
 from langchain_groq import ChatGroq  # LangChain's wrapper around Groq's hosted chat models
 
 from sql_generator import SYSTEM_PROMPT, SQLGenerationResult  # reuse the SAME prompt and result schema as the Gemini version -- only the model differs
+from business_rules import BUSINESS_RULES  # domain rules shared with the ambiguity classifier (cancelled orders are not sales)
 from schema_retrieval import retrieve_relevant_tables  # Step 3b: embedding search returning the tables relevant to a question
 
 load_dotenv()  # load .env now, before the Groq client is created below
@@ -22,7 +24,8 @@ generator = model.with_structured_output(SQLGenerationResult)  # parse the reply
 def generate_sql(resolved_question: str) -> SQLGenerationResult:  # main entry point: one resolved question in, one typed result out
     relevant = retrieve_relevant_tables(resolved_question, top_k=4)  # top 4 tables by similarity (all 4 today)
     schema_text = "\n\n".join(desc for _, desc, _ in relevant)  # keep only the description text of each table, blank-line separated
-    system = SYSTEM_PROMPT.format(schema=schema_text)  # fill the {schema} placeholder in the shared prompt
+    today_line = f"Today's date is {date.today().isoformat()}. Use it to turn relative dates such as 'last year' into explicit calendar years; never guess the current year.\n\n"  # models have no clock; resolved questions may say "last year"
+    system = today_line + BUSINESS_RULES + SYSTEM_PROMPT.format(schema=schema_text)  # today's date, then the shared business rules, then the shared prompt with its {schema} placeholder filled in
     return generator.invoke([("system", system), ("human", resolved_question)])  # call Groq with system + user messages; returns a SQLGenerationResult
 
 

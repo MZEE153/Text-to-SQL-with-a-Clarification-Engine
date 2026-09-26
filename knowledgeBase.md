@@ -532,3 +532,304 @@ the standing convention for all future steps (7–10 included):
 | `schema_retrieval.py` | `HuggingFaceEmbeddings` (`all-MiniLM-L6-v2`, local), `sklearn` `cosine_similarity` | RAG over the schema: rank tables by similarity to the question |
 | `gemini_smoke_test.py` | `ChatGoogleGenerativeAI`, `model.invoke` | Minimal proof the Gemini key and model name work |
 | `ambiguity_classifier.py` | `pydantic` models, `with_structured_output`, `retrieve_relevant_tables(top_k=4)` | 3-way classification: clear / default-with-stated-assumption / ask the user |
+
+### Step 7 — Safe execution (read-only role, timeout, row cap)
+
+**Design.** The Step 6 validator is software; the real boundary is the
+database. Generated SQL now runs as a dedicated Postgres role,
+`txt2sql_readonly`, created by `setup_readonly_role.py`:
+
+- `LOGIN` with every powerful attribute stripped (`NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOREPLICATION NOBYPASSRLS`), 10-connection limit.
+- `GRANT SELECT` on exactly the 4 allowlisted tables — nothing else. The
+  script imports `ALLOWED_TABLES` from `sql_validator.py`, so the
+  validator's allowlist and the role's grants cannot drift apart.
+- Role-level defaults: `statement_timeout = 5s`,
+  `default_transaction_read_only = on`,
+  `idle_in_transaction_session_timeout = 10s`. Also revoked `TEMPORARY` on
+  the database and `CREATE` on the `public` schema from `PUBLIC` (a
+  no-op for schema `CREATE` on Postgres 16, made explicit; the only other
+  role is the admin superuser, which is unaffected).
+- `sql_executor.py` connects as that role and layers on its own limits:
+  `TIMEOUT_MS = 5000`, `MAX_ROWS = 100`, read-only transactions, and a
+  server-side cursor (`stream_results=True`) with `fetchmany(MAX_ROWS + 1)`
+  — the extra row only exists to tell us whether we truncated.
+  `execute_sql()` calls `validate_sql()` first, so the order is: validator
+  → read-only role → read-only transaction → timeout → row cap.
+
+**The password never appeared anywhere.** After the token-leak incidents,
+the setup script generates the role password itself
+(`secrets.token_urlsafe(24)`), appends it to `.env`, and prints only the
+key names. `.env` had no trailing newline, so the append adds one first
+(otherwise the new line would have glued onto `LANGSMITH_PROJECT`).
+Verified by grepping for line shapes, never by printing values: previous
+last line intact, both new lines present, `.env` still git-ignored.
+`CREATE ROLE ... PASSWORD` cannot take normal bind parameters, so the
+script uses `psycopg.sql` (`Identifier` / `Literal`) to compose the
+statement with correct quoting. `.env.example` gained blank template
+entries only.
+
+**Results — `test_sql_executor.py`, 25 checks, all passed first run**
+(no LLM involved, so no API quota used):
+
+| Section | What was checked | Result |
+|---|---|---|
+| A | The 4 ground-truth queries via the executor | 12 systems; Acme Corp `50000.01`; Stark Industries `27999.96`; total sales `3077465.82` — all 2–18 ms |
+| A | Edge syntax: `::text` cast, `'12:30:00'` literal, `LIKE 'A%'` | Executed fine — SQLAlchemy `text()` did not mistake them for bind parameters (only these cases tried; other colon patterns untested) |
+| B | 3-million-row cross join | Returned 100 rows, `truncated=True`, 3 ms — nothing near 3M rows was materialised (I did not measure the non-streaming alternative, so "streaming is why" is design reasoning, not a measured comparison) |
+| B | `pg_sleep(10)` and a ~2-billion-combination 3-way cross-join `COUNT(*)` | Both cancelled by the server after 5010 ms and 5162 ms |
+| C | `DELETE`, `pg_shadow`, data-modifying CTE | All rejected by the validator before reaching the database |
+| D | 7 mutating statements (`DELETE`, `INSERT`, `UPDATE`, `DROP TABLE`, `TRUNCATE`, `CREATE TABLE`, the CTE trick) attempted **directly as the role, bypassing the validator** | All refused. Default mode → `ReadOnlySqlTransaction`; with `SET TRANSACTION READ WRITE` first (read-only layer switched off) → `InsufficientPrivilege` |
+| D | `SELECT * FROM pg_shadow`, `SELECT pg_read_file('/etc/passwd')` as the role | Both `InsufficientPrivilege` |
+| D | Row counts of all 4 tables before vs after every attack | Identical: `(60, 1236, 2378, 150)` |
+
+**End to end with Groq** (`test_pipeline_5_6_7_groq.py`, `openai/gpt-oss-20b`):
+generate → validate → execute returned the correct answer for **4/4**
+questions (12; Acme Corp; Stark Industries; `3077465.82`), 9–59 ms each.
+
+**What the two-mode attack test actually shows.** Switching the
+read-only-transaction layer off with `SET TRANSACTION READ WRITE` was
+permitted for the role, and the statement then failed on privileges
+instead. So `default_transaction_read_only` is a *default a session can
+override*, while the missing `INSERT/UPDATE/DELETE/TRUNCATE/CREATE`
+privileges are not. That is why the privilege grant, not the setting, is
+called the boundary. (I did not test whether a session can override
+`statement_timeout`; the timeout is best treated as a guard against
+accidents, not against a determined attacker.) The attack statements ran
+inside connections that always roll back, so even a misconfigured role
+could not have left damage behind.
+
+**Genuine gap found (not fixed): the validator does not restrict function
+calls.** `SELECT pg_sleep(10) FROM customers LIMIT 1` is a valid `SELECT`
+on an allowed table, so it passed Step 6 and was stopped only by the
+timeout. More dangerous functions were stopped only by the role
+(`pg_read_file` → `InsufficientPrivilege`). Nothing in the validator would
+have blocked them. This is the layering working as designed — but it means
+the validator alone is weaker than its docstring might suggest. **Backlog:**
+add a function allowlist/blocklist to `validate_sql` (e.g. `pg_sleep`,
+`pg_read_file`, `set_config`, `lo_*`) so the cheap software layer catches
+these before a database round trip. Also untested: PostgreSQL lets any role
+read `pg_catalog` / `information_schema` by default; the validator's table
+allowlist is what keeps generated SQL away from them.
+
+**What Step 7 uses, and why**
+
+| File | Uses | For |
+|---|---|---|
+| `setup_readonly_role.py` | `psycopg` + `psycopg.sql` (`Identifier`, `Literal`), `secrets`, `dotenv_values`, `information_schema.role_table_grants` | Idempotent role creation; password generated into `.env` unseen; prints the effective grants as proof |
+| `sql_executor.py` | `sqlalchemy` engine with `connect_args={"options": "-c statement_timeout=... -c default_transaction_read_only=on"}`, `stream_results`, `fetchmany`, `psycopg.errors.QueryCanceled`, `dataclass` | Run validated SQL as the read-only role with timeout and row cap; typed `QueryResult` |
+| `test_sql_executor.py` | Direct attacks through `ro_engine` (bypassing the validator), `SET TRANSACTION READ WRITE`, before/after row counts | Prove each layer independently |
+| `test_pipeline_5_6_7_groq.py` | `generate_sql` (Groq) → `execute_sql` | Full chain against ground truth |
+
+### Step 8 — Result formatting (rows → plain-English answer)
+
+**Design.** The risk at this stage is the model stating something the data
+doesn't say. So anything that *must* appear is kept out of the model's
+hands (`answer_formatter.py`):
+
+- **Appended by code, never by the model:** the Step 4 `assumed_default`
+  ("Assumption: ..."), the "result was cut off at 100 rows" note, and a
+  visible "Warning: the number(s) ... could not be matched" line. The
+  model can't forget or reword them. `compose_text()` is a pure function,
+  so this assembly is testable with no model.
+- **Empty result never reaches the model** ("No matching records were
+  found." — fixed wording, no API call). Asking a model to describe
+  "nothing" invites invention.
+- **Numeric grounding check:** every number in the model's sentence is
+  canonicalised (`Decimal`, so `50,000.01` = `50000.01`, `50000.10` =
+  `50000.1`, `01` = `1`) and must appear in the rows the model was
+  shown, the question, the SQL, or the assumption; unmatched numbers are
+  flagged to the user, not silently trusted. The SQL counts as a source
+  so a year literal written into the query is grounded.
+- Rows are serialised as JSON with `default=str`, so `Decimal` and date
+  values reach the model as exact strings (no float rounding). At most 25
+  rows are shown (`PROMPT_ROWS`); the model is told when rows were
+  omitted or the result was truncated so it can't present a partial
+  result as complete.
+- Model: Groq `openai/gpt-oss-20b`, temperature 0, structured output
+  (`AnswerDraft`). No Gemini variant was built, so this stage currently
+  has no provider fallback — relevant to the Step 9 fallback question.
+
+**Results — `test_answer_formatter.py`, 18 checks, passed on two runs.**
+Section A (no model, 12 checks): number matching across separators and
+trailing zeros; a fabricated `51,000` caught; a model-guessed year
+`2025` caught when absent from data/question/SQL; numeric (not text)
+sort of flagged numbers; message assembly order (answer → warning →
+cut-off note → assumption); empty result skips the model and still
+appends the assumption. Section B (live, 6 cases against real executor
+output, 6/6): single count → "12 systems signed off in 2025."; revenue
+winner (Acme Corp, 50000.01); profit winner (Stark Industries,
+27999.96); total sales with the assumption line appended; a 5-row list
+where all five names and their exact figures were mentioned
+(including `45000.00` with its trailing zeros); the truncated
+cross join with the cut-off note appended. No unmatched numbers in any.
+**Nothing broke this step** — unlike Steps 4–7 there was no failure or
+surprise to record.
+
+**What this does NOT catch (stated plainly, not glossed over):**
+- **Swapped values pass.** The check proves a number *exists* in the
+  data, not that it belongs to the name beside it — "Acme Corp earned
+  45000.00 and Initech earned 50000.01" is flagged as fine. This is
+  encoded as a test labelled `KNOWN LIMITATION`, so it can't be
+  forgotten.
+- **Names and non-numeric claims are unchecked** — a misstated name or
+  relationship isn't detected. (In the truncated-result case the model
+  said orders 1–25 "are each paired with order item 1"; the check only
+  confirmed those numbers occur in the data. I did not verify the pairing
+  claim itself.)
+- **Digits inside emails, ids or dates in the data can ground a
+  coincidental number** — the check is deliberately simple.
+- **Untested live: the "last year" wording.** The live questions were
+  phrased "in 2025" (the year appears in the question), which sidesteps
+  the scenario where the pipeline's usual "last year" leads the model to
+  write a year that appears nowhere in the data. In that scenario the
+  checker would flag a *correct* year as ungrounded — a noisy warning,
+  not a wrong answer. Step 9's end-to-end run is where to see this.
+- **Small sample**: 6 live cases, temperature 0 but not guaranteed
+  identical across runs; both runs passed.
+
+**Observation / possible polish:** the prompt allowed thousands
+separators but the model wrote plain figures ("totaling 50000.01") and no
+currency symbol (also as instructed — the schema has none). Faithful but
+less readable; formatting numbers in code rather than asking the model
+would be the deterministic fix. Not done.
+
+| File | Uses | For |
+|---|---|---|
+| `answer_formatter.py` | `ChatGroq` + `with_structured_output(AnswerDraft)`, `json.dumps(default=str)`, `re` + `Decimal` for number canonicalisation, `dataclass FinalAnswer` | Word the answer; check numbers; append assumption / cut-off / warning lines in code |
+| `test_answer_formatter.py` | Deterministic unit checks + live cases through `execute_sql` → `format_answer` | Prove the checker, the assembly and the empty path without a model, then 6 real answers |
+
+### Step 9 — LangGraph orchestration (branch, pause/resume, checkpointing)
+
+**The graph** (`txt2sql_graph.py`):
+
+```
+START → classify ─┬─ ambiguous ──→ ask_user (interrupt: PAUSE) ─┐
+                  └─ clear / default ───────────────────────────┴→ resolve → generate → execute ─┬─ ok ──→ format → END
+                                                                                                  └─ error → fail → END
+```
+
+- One node per stage (Steps 4–8); the two branches are plain Python
+  routers reading typed state.
+- **Checkpointer = SQLite file**, not in-memory: the point of the pause is
+  that the user may answer later, from another process. (`InMemorySaver`
+  forgets on exit; Postgres would have put checkpoint tables in the
+  `txt2sql` schema that `schema_retrieval` introspects and embeds.) Needed
+  `pip install langgraph-checkpoint-sqlite`; `checkpoints.sqlite*` is
+  git-ignored (it holds user questions and query results).
+- `run_graph.py` is the real entry point: `ask "..."` runs until it
+  finishes or pauses (then prints numbered options and **exits**);
+  `answer --thread <id> <number or your own definition>` is a separate
+  process that resumes from the file.
+- Everything runs on Groq. Added `ambiguity_classifier_groq.py` (same
+  prompt and schema as the Gemini version) so the whole graph doesn't
+  depend on Gemini's 20/day cap.
+
+**What broke or surprised along the way** (in the order it happened —
+none of these were visible from reading the code):
+
+1. **The Groq classifier calibrates differently from Gemini** (same prompt,
+   different model; regression questions): "profit margin" is now flagged
+   *ambiguous* (Gemini: not); "total sales" gets *no* stated assumption
+   (Gemini stated one); "what is the name of the computer?" invents an
+   interpretation using a status `'active'` that doesn't exist in the
+   schema's `CHECK` constraint (the known no-"out-of-scope"-state gap).
+   The Step 4 hand-tuning does not transfer between models.
+2. **The model doesn't know today's date.** Every interpretation for "best
+   customer last year" said `2023-01-01` to `2023-12-31` (today is
+   2026, so last year is 2025). Since the graph hands the chosen
+   definition straight to the SQL generator, a clarified answer would have
+   been computed for the wrong year. Fix: a "Today's date is ..." line at
+   the top of the Groq classifier and generator prompts; re-checked, the
+   interpretations now say 2025. (The Gemini variants were **not** given
+   this fix.)
+3. **LangGraph warned it will block saving custom classes in checkpoints**
+   ("Deserializing unregistered type ...AmbiguityCheck / ...QueryResult ...
+   will be blocked in a future version"). Fix: state holds plain data only
+   (`check.model_dump()`, `dataclasses.asdict(result)`), and the tests set
+   `LANGGRAPH_STRICT_MSGPACK=true` so any custom class would raise
+   instead of warn. `date` and `Decimal` values from real rows survive the
+   round trip with their exact types.
+4. **Raising an exception after a resume bricks the thread.** First design:
+   `ask_user` raised `ValueError` on an out-of-range choice. Probing what
+   that leaves behind: `state.next` became `()` (looks *finished*, but
+   there is no answer), the failed task shows the error, and every later
+   resume **replays the stored bad value** (`9`) and fails again.
+   Fix: never raise — on invalid input the node calls `interrupt()` again
+   with an error message. This works because on resume the node **re-runs
+   from the top** and each `interrupt()` call receives the resume values
+   in order. Consequence to remember: keep anything with side effects out
+   of `ask_user` before its `interrupt()`.
+5. **`state.next` is not a reliable "waiting for the user" signal.** After
+   a second pause on the same node it reads `()` even though the thread
+   is waiting (probed: `tasks` and `snapshot.interrupts` stayed populated).
+   The CLI and tests use `state.interrupts` / `state.tasks` instead.
+6. **My first live test "passed" while printing wrong numbers.** The run
+   answered *Acme Corp spent 58000.01* (truth: 50000.01) and *Globex Inc
+   with 13 orders* (truth: 12): the cancelled orders were counted. The test
+   only checked that the winner's *name* appeared. Cause: the Groq
+   classifier wrote definitions like "sum of total_amount from all orders
+   placed in 2025", and the generator obeyed that explicit wording over its
+   own "sales means completed" default. This is the long-standing backlog
+   item about cancelled orders, now with concrete impact. Fix:
+   `business_rules.py` — one shared rule ("cancelled orders are not sales;
+   count only `status = 'completed'`, even if an interpretation says 'all
+   orders'; interpretation definitions must say so") read by both the Groq
+   classifier and generator. The live test now checks **figures**, not just
+   names. After the fix all three clarified SQL statements contain
+   `status = 'completed'`.
+
+**Results.**
+- `test_graph.py` — **30 checks, no LLM, strict serializer mode, all pass:**
+  clear path skips `ask_user`; ambiguous path pauses with the options and
+  runs nothing downstream; resume continues from `ask_user` and the
+  classifier is called **exactly once** in total (no repeat LLM call);
+  chosen definition reaches the generator and is shown with the answer;
+  out-of-range and blank answers leave the thread paused and re-ask, and a
+  later valid answer completes it; unsafe SQL (`DELETE`) routes to `fail`
+  and the formatter is never called; a brand-new connection + graph
+  resumes a paused thread purely from the file; two threads stay
+  isolated; `date`/`Decimal` round-trip.
+- `test_graph_live.py` — real CLI, real Groq, separate processes (second
+  run, after fixes): "systems signed off last year" → 12; the **one
+  question "Who was the best customer last year?" paused, and resumed in a
+  different process, gave three different correct answers** depending on
+  the chosen interpretation — revenue → Acme Corp **50000.01**, order
+  count → Globex Inc **12**, profit → Stark Industries **27999.96**;
+  "total sales in all years" → **3077465.82**; answering a thread that
+  isn't waiting gives a clear message.
+- Regression after the prompt changes: Steps 5–7 chain 4/4, validator
+  7/7, executor suite passes.
+
+**Limits and what's still open (stated plainly):**
+- **Small live sample, non-deterministic model.** One live run per metric
+  after the fix. The classifier's options and their order vary between
+  runs even at temperature 0 (revenue was option 0 in one run and option
+  0/1/2 in others), so the test picks by label. The business-rule fix is a
+  prompt instruction, verified but not proven robust.
+- **A silent assumption remains:** "total sales" produces a
+  completed-only query but no "Assumption:" line, because the classifier
+  stated none; the SQL is shown by the CLI but the answer text doesn't
+  disclose the completed-only choice.
+- **The "Assumption:" label is slightly off for a definition the user
+  *chose*.** Cosmetic; not changed.
+- **No provider fallback was built.** Everything is Groq; the Gemini
+  classifier/generator lack the date and business-rule lines. The
+  earlier idea of a Groq→Gemini fallback is still open.
+- **No retry/error handling for LLM API failures** (429/503) in
+  `classify`/`generate`/`format`: an exception there propagates and ends
+  the run. Not built and not tested (whether re-invoking resumes from the
+  last checkpoint is unverified).
+- **No cleanup of old threads** in `checkpoints.sqlite` (it keeps every
+  conversation's questions and rows).
+- The "last year" year-guessing scenario for the formatter (Step 8
+  backlog) did not trigger: none of the answers stated a year.
+
+| File | Uses | For |
+|---|---|---|
+| `txt2sql_graph.py` | `langgraph` `StateGraph`, `add_conditional_edges`, `interrupt`, `TypedDict` state of plain data | The workflow: classify → (ask_user) → resolve → generate → execute → format / fail |
+| `run_graph.py` | `SqliteSaver.from_conn_string`, `Command(resume=...)`, `argparse` | CLI where pause and resume are separate processes |
+| `ambiguity_classifier_groq.py` | `ChatGroq` + `with_structured_output(AmbiguityCheck)`, today's date, `BUSINESS_RULES` | Step 4 on Groq |
+| `business_rules.py` | one shared string constant | Domain rule read by both the classifier and the generator |
+| `test_graph.py` | `unittest.mock.patch.object` stubs, `SqliteSaver`, `Command`, strict msgpack mode | 30 LLM-free checks of routing, pause/resume, persistence |
+| `test_graph_live.py` | `subprocess` (a new process per command), regex over CLI output | End-to-end with real models, checking figures |
